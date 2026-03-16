@@ -1,21 +1,21 @@
-use std::path::{Path, PathBuf};
+use chrono::{Local, NaiveDateTime, TimeZone};
+use filetime::{self, FileTime};
 use lopdf::Document;
 use std::fs;
 use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use zip::{ZipArchive, ZipWriter, write::FileOptions};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("========================================");
-    println!("   PDF & Word 批量元数据清理工具");
+    println!("   PDF & Word 综合处理工具 (v0.4)");
     println!("========================================");
 
-    // --- 1. 获取用户输入的路径 ---
+    // 1. 获取输入路径
     print!("请输入文件或文件夹路径: ");
     io::stdout().flush()?;
-    
     let mut input_str = String::new();
     io::stdin().read_line(&mut input_str)?;
-    // 处理路径：去除两端的空格，并去掉因拖拽文件可能产生的双引号
     let input_path = PathBuf::from(input_str.trim().replace("\"", ""));
 
     if !input_path.exists() {
@@ -24,146 +24,241 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    // --- 2. 收集所有待处理的文件 ---
+    // 2. 选择功能模式
+    println!("\n请选择操作模式:");
+    println!(" [1] 仅清理元数据 (删除作者、公司、创建时间等内部信息)");
+    println!(" [2] 仅修改系统时间 (创建/修改/访问时间)");
+    println!(" [3] 全套处理 (清理元数据 + 修改系统时间)");
+    print!("请输入选项 (1/2/3): ");
+    io::stdout().flush()?;
+    let mut mode_str = String::new();
+    io::stdin().read_line(&mut mode_str)?;
+    let mode = mode_str.trim();
+
+    // 3. 如果需要修改时间，则提前询问
+    let mut times = None;
+    if mode == "2" || mode == "3" {
+        println!("\n--- 时间设置 (格式: YYYY-MM-DD HH:MM:SS，直接回车使用当前时间) ---");
+        let t_create = ask_time("创建时间 (Created)");
+        let t_modify = ask_time("修改时间 (Modified)");
+        let t_access = ask_time("访问时间 (Accessed)");
+        times = Some((t_create, t_modify, t_access));
+    }
+
+    // 4. 收集文件
     let mut files = Vec::new();
     if input_path.is_file() {
         files.push(input_path);
     } else {
-        // 如果是文件夹，遍历其中的所有文件
         for entry in fs::read_dir(&input_path)? {
             let path = entry?.path();
-            if path.is_file() { files.push(path); }
+            if path.is_file() {
+                files.push(path);
+            }
         }
     }
 
-    // --- 3. 循环处理每一个文件 ---
+    // 5. 核心处理循环
     for file in files {
-        let ext = file.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-        // 自动跳过已经清理过的文件，避免重复处理
-        if file.to_string_lossy().contains("_cleaned") { continue; }
+        let ext = file
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if file.to_string_lossy().contains("_processed") {
+            continue;
+        }
+
+        let file_display = file.file_name().unwrap().to_string_lossy();
 
         match ext.as_str() {
-            "pdf" => {
-                print!("正在清理 PDF: {}... ", file.file_name().unwrap().to_string_lossy());
-                if let Ok(_) = process_pdf(&file) { println!("✅"); }
-            },
-            "docx" => {
-                print!("正在清理 Word: {}... ", file.file_name().unwrap().to_string_lossy());
-                if let Ok(_) = process_docx(&file) { println!("✅"); }
-            },
-            _ => {} // 忽略其他格式
+            "pdf" | "docx" => {
+                print!("正在处理 {}: {}... ", ext.to_uppercase(), file_display);
+
+                // 执行清理模式或直接复制
+                let target_path = if mode == "1" || mode == "3" {
+                    match ext.as_str() {
+                        "pdf" => process_pdf(&file).ok(),
+                        "docx" => process_docx(&file).ok(),
+                        _ => None,
+                    }
+                } else {
+                    // 仅修改时间模式下，生成一个副本以保持一致性
+                    let mut out = file.clone();
+                    out.set_file_name(format!(
+                        "{}_processed.{}",
+                        file.file_stem().unwrap().to_string_lossy(),
+                        ext
+                    ));
+                    fs::copy(&file, &out).ok().map(|_| out)
+                };
+
+                // 执行时间修改
+                if let Some(path) = target_path {
+                    if let Some((c, m, a)) = times {
+                        let _ = apply_precise_timestamps(&path, c, a, m);
+                    }
+                    println!("✅");
+                } else {
+                    println!("❌ 处理失败");
+                }
+            }
+            _ => {}
         }
     }
 
-    println!("\n所有任务已完成！");
+    println!("\n✨ 任务执行完毕！");
     wait_for_keypress();
     Ok(())
 }
 
-/// Word (DOCX) 处理函数
-/// 原理：DOCX 是 ZIP 包，元数据存在 docProps 文件夹下的 XML 中
-fn process_docx(input_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+// ================= 系统调用部分 (Win32 API) =================
+
+fn apply_precise_timestamps(path: &Path, c: FileTime, a: FileTime, m: FileTime) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        let file = fs::OpenOptions::new().write(true).open(path)?;
+        let handle = file.as_raw_handle() as *mut std::ffi::c_void;
+
+        let to_win_ft = |ft: FileTime| {
+            let unix_nanos = ft.unix_seconds() * 1_000_000_000 + ft.nanoseconds() as i64;
+            let intervals = unix_nanos / 100 + 116_444_736_000_000_000;
+            WinFileTime {
+                dw_low: (intervals & 0xFFFFFFFF) as u32,
+                dw_high: (intervals >> 32) as u32,
+            }
+        };
+
+        #[repr(C)]
+        struct WinFileTime {
+            dw_low: u32,
+            dw_high: u32,
+        }
+
+        unsafe extern "system" {
+            fn SetFileTime(
+                h: *mut std::ffi::c_void,
+                c: *const WinFileTime,
+                a: *const WinFileTime,
+                m: *const WinFileTime,
+            ) -> i32;
+        }
+
+        let (ft_c, ft_a, ft_m) = (to_win_ft(c), to_win_ft(a), to_win_ft(m));
+        unsafe {
+            if SetFileTime(handle, &ft_c, &ft_a, &ft_m) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+    }
+    Ok(())
+}
+
+// ================= 文档清理部分 =================
+
+fn process_docx(input_path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let mut output_path = input_path.to_path_buf();
-    output_path.set_file_name(format!("{}_cleaned.docx", input_path.file_stem().unwrap().to_string_lossy()));
+    output_path.set_file_name(format!(
+        "{}_processed.docx",
+        input_path.file_stem().unwrap().to_string_lossy()
+    ));
 
     let file = fs::File::open(input_path)?;
     let mut archive = ZipArchive::new(file)?;
-    
     let out_file = fs::File::create(&output_path)?;
     let mut zip_out = ZipWriter::new(out_file);
 
-    // 遍历原始压缩包中的每一个文件
     for i in 0..archive.len() {
         let mut inner_file = archive.by_index(i)?;
-        let name = inner_file.name().to_string();
-        
-        // 必须显式指定 FileOptions<()> 兼容 zip 库新版本的泛型要求
-        let options: FileOptions<()> = FileOptions::default()
-            .compression_method(inner_file.compression());
+        let options: FileOptions<'_, ()> =
+            FileOptions::default().compression_method(inner_file.compression());
+        zip_out.start_file(inner_file.name(), options)?;
 
-        zip_out.start_file(&name, options)?;
+        let mut buffer = Vec::new();
+        inner_file.read_to_end(&mut buffer)?;
 
-        // 如果是存储元数据的 XML 文件，则进行内容清洗
-        if name == "docProps/core.xml" || name == "docProps/app.xml" {
-            let mut content = String::new();
-            inner_file.read_to_string(&mut content)?;
-            
-            // 需要清空的 XML 标签列表
+        if inner_file.name() == "docProps/core.xml" || inner_file.name() == "docProps/app.xml" {
+            let mut content = String::from_utf8_lossy(&buffer).into_owned();
             let tags = [
-                "dc:creator", "cp:lastModifiedBy", "cp:keywords", 
-                "dc:description", "dc:title", "Company", "Manager"
+                "dc:creator",
+                "cp:lastModifiedBy",
+                "cp:keywords",
+                "dc:description",
+                "dc:title",
+                "Company",
+                "Manager",
             ];
-
-            let mut final_xml = content;
             for tag in tags {
-                let start_tag = format!("<{}>", tag);
-                let end_tag = format!("</{}>", tag);
-                
-                // 定位标签位置：如果找到成对的标签，则清空中间的文本
-                if let Some(start_idx) = final_xml.find(&start_tag) {
-                    if let Some(end_idx) = final_xml.find(&end_tag) {
-                        let content_start = start_idx + start_tag.len();
-                        if content_start < end_idx {
-                            // 保持标签结构不变，仅抹除内容
-                            final_xml.replace_range(content_start..end_idx, "");
-                        }
-                    }
+                let s = format!("<{}>", tag);
+                let e = format!("</{}>", tag);
+                if let (Some(si), Some(ei)) = (content.find(&s), content.find(&e)) {
+                    content.replace_range((si + s.len())..ei, "");
                 }
             }
-            zip_out.write_all(final_xml.as_bytes())?;
+            zip_out.write_all(content.as_bytes())?;
         } else {
-            // 对于非元数据文件（如正文文字、图片等），直接原样拷贝
-            let mut buffer = Vec::new();
-            inner_file.read_to_end(&mut buffer)?;
             zip_out.write_all(&buffer)?;
         }
     }
     zip_out.finish()?;
-    Ok(())
+    Ok(output_path)
 }
 
-/// PDF 处理函数
-/// 原理：删除 Trailer 中的 Info 字典键值对，并物理删除 Root 下的 Metadata 对象流
-fn process_pdf(input_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn process_pdf(input_path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let mut output_path = input_path.to_path_buf();
-    output_path.set_file_name(format!("{}_cleaned.pdf", input_path.file_stem().unwrap().to_string_lossy()));
-    
+    output_path.set_file_name(format!(
+        "{}_processed.pdf",
+        input_path.file_stem().unwrap().to_string_lossy()
+    ));
     let mut doc = Document::load(input_path)?;
-    
-    // 1. 清理 Info 字典 (兼容不同版本的 Result/Option 嵌套)
-    if let Some(info_id) = doc.trailer.get(b"Info").ok().and_then(|info| info.as_reference().ok()) {
-        if let Ok(info_dict) = doc.get_object_mut(info_id).and_then(|obj| obj.as_dict_mut()) {
-            let keys: &[&[u8]] = &[b"Author", b"Creator", b"Producer", b"Title", b"Subject", b"Keywords", b"Company"];
-            for &k in keys { 
-                info_dict.remove(k); 
+    if let Ok(info_id) = doc
+        .trailer
+        .get(b"Info")
+        .and_then(|info| info.as_reference())
+    {
+        if let Ok(dict) = doc.get_object_mut(info_id).and_then(|o| o.as_dict_mut()) {
+            let keys: &[&[u8]] = &[
+                b"Author",
+                b"Creator",
+                b"Producer",
+                b"Title",
+                b"Subject",
+                b"Keywords",
+                b"Company",
+                b"CreationDate",
+                b"ModDate",
+            ];
+            for &k in keys {
+                dict.remove(k);
             }
         }
     }
-
-    // 2. 清理现代 PDF 常用 XML Metadata (存储在 Root 节点)
-    let mut meta_id = None;
-    // 先查找 Root 字典中是否存在 Metadata 引用
-    if let Some(root_id) = doc.trailer.get(b"Root").ok().and_then(|o| o.as_reference().ok()) {
-        if let Ok(root) = doc.get_object(root_id).and_then(|o| o.as_dict()) {
-            meta_id = root.get(b"Metadata").ok().and_then(|o| o.as_reference().ok());
-        }
-        
-        // 如果找到了 Metadata 对象 ID
-        if let Some(id) = meta_id {
-            // 首先从 Root 字典中移除该键
-            if let Ok(root_mut) = doc.get_object_mut(root_id).and_then(|o| o.as_dict_mut()) {
-                root_mut.remove(b"Metadata");
-            }
-            // 然后在 PDF 数据库中彻底物理删除该对象
-            doc.objects.remove(&id);
-        }
-    }
-
     doc.save(&output_path)?;
-    Ok(())
+    Ok(output_path)
 }
 
-/// 保持窗口开启，防止程序运行完立即闪退
+// ================= 辅助函数 =================
+
+fn ask_time(label: &str) -> FileTime {
+    print!("{}: ", label);
+    io::stdout().flush().unwrap();
+    let mut s = String::new();
+    io::stdin().read_line(&mut s).unwrap();
+    let s = s.trim();
+    if s.is_empty() {
+        FileTime::now()
+    } else {
+        match NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+            Ok(dt) => {
+                let local_dt = Local.from_local_datetime(&dt).single().expect("解析错误");
+                FileTime::from_unix_time(local_dt.timestamp(), 0)
+            }
+            Err(_) => FileTime::now(),
+        }
+    }
+}
+
 fn wait_for_keypress() {
     println!("\n按下回车键退出...");
     let _ = io::stdin().read_line(&mut String::new());
