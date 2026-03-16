@@ -1,45 +1,87 @@
-use std::path::PathBuf;
-use clap::Parser;
+use std::path::{Path, PathBuf};
 use lopdf::Document;
 use std::fs;
-
-#[derive(Parser, Debug)]
-#[command(name = "pdf_clear")]
-struct Args {
-    #[arg(required = true)]
-    input: PathBuf,
-
-    #[arg(short, long)]
-    output: Option<PathBuf>,
-}
+use std::io::{self, Write};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+    println!("========================================");
+    println!("     PDF 批量元数据清理工具 (v1.1)");
+    println!("========================================");
 
-    if !args.input.exists() {
-        return Err(format!("输入文件不存在: {}", args.input.display()).into());
+    // --- 交互环节 ---
+    print!("请输入 PDF 文件或文件夹的路径: ");
+    io::stdout().flush()?;
+    
+    let mut input_str = String::new();
+    io::stdin().read_line(&mut input_str)?;
+    let input_path = PathBuf::from(input_str.trim().replace("\"", "")); // 处理拖入文件时可能带有的双引号
+
+    if !input_path.exists() {
+        println!("❌ 错误：路径不存在！");
+        wait_for_keypress();
+        return Ok(());
     }
 
-    let output_path = args.output.unwrap_or_else(|| {
-        let mut path = args.input.clone();
-        path.set_file_name(format!(
-            "{}_cleaned.pdf",
-            path.file_stem().unwrap_or_default().to_string_lossy()
-        ));
-        path
-    });
+    // --- 收集待处理文件 ---
+    let mut files_to_process = Vec::new();
+    if input_path.is_file() {
+        if is_pdf(&input_path) {
+            files_to_process.push(input_path);
+        }
+    } else {
+        // 扫描文件夹
+        for entry in fs::read_dir(&input_path)? {
+            let path = entry?.path();
+            if path.is_file() && is_pdf(&path) {
+                // 排除已经是 _cleaned 的文件，防止循环处理
+                if !path.to_string_lossy().contains("_cleaned.pdf") {
+                    files_to_process.push(path);
+                }
+            }
+        }
+    }
 
-    let mut doc = Document::load(&args.input)
-        .map_err(|e| format!("无法加载PDF文件: {}", e))?;
+    if files_to_process.is_empty() {
+        println!("⚠️ 未发现可处理的 PDF 文件。");
+        wait_for_keypress();
+        return Ok(());
+    }
 
-    // --- 1. 清理 Info 字典 ---
+    println!("🚀 找到 {} 个文件，准备开始清理...", files_to_process.len());
+
+    // --- 循环处理 ---
+    let mut success_count = 0;
+    for file in files_to_process {
+        match process_pdf(&file) {
+            Ok(out) => {
+                println!("✅ 已清理: {}", out.file_name().unwrap().to_string_lossy());
+                success_count += 1;
+            }
+            Err(e) => println!("❌ 失败: {} (原因: {})", file.display(), e),
+        }
+    }
+
+    println!("\n任务结束！成功处理 {} 个文件。", success_count);
+    wait_for_keypress();
+    Ok(())
+}
+
+/// 核心处理逻辑：清理单个 PDF
+fn process_pdf(input_path: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let mut output_path = input_path.to_path_buf();
+    output_path.set_file_name(format!(
+        "{}_cleaned.pdf",
+        input_path.file_stem().unwrap_or_default().to_string_lossy()
+    ));
+
+    let mut doc = Document::load(input_path)?;
+
+    // 1. 清理 Info 字典
     if let Some(info_id) = doc.trailer.get(b"Info").and_then(|info| info.as_reference()).ok() {
         if let Ok(info_dict) = doc.get_object_mut(info_id).and_then(|obj| obj.as_dict_mut()) {
-            // 显式指定类型以解决 [u8; N] 长度不匹配问题
             let keys_to_remove: &[&[u8]] = &[
                 b"Title", b"Author", b"Subject", b"Keywords",
-                b"Creator", b"Producer", b"CreationDate", b"ModDate",
-                b"Trapped", b"Company", b"Manager", b"Category"
+                b"Creator", b"Producer", b"CreationDate", b"ModDate", b"Trapped"
             ];
             for &key in keys_to_remove {
                 info_dict.remove(key);
@@ -47,36 +89,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // --- 2. 清理 Root 中的 Metadata (分步操作以避免多次可变借用) ---
-    let mut metadata_id_to_delete = None;
-
-    // 步骤 A: 查找 ID (只读借用)
+    // 2. 清理 Root 中的 Metadata 流
+    let mut metadata_id = None;
     if let Some(root_id) = doc.trailer.get(b"Root").and_then(|obj| obj.as_reference()).ok() {
         if let Ok(root_dict) = doc.get_object(root_id).and_then(|obj| obj.as_dict()) {
-            metadata_id_to_delete = root_dict.get(b"Metadata").and_then(|obj| obj.as_reference()).ok();
+            metadata_id = root_dict.get(b"Metadata").and_then(|obj| obj.as_reference()).ok();
         }
-
-        // 步骤 B: 从字典中移除键 (可变借用)
-        if metadata_id_to_delete.is_some() {
+        if let Some(id) = metadata_id {
             if let Ok(root_dict) = doc.get_object_mut(root_id).and_then(|obj| obj.as_dict_mut()) {
                 root_dict.remove(b"Metadata");
             }
+            doc.objects.remove(&id);
         }
     }
 
-    // 步骤 C: 物理删除对象 (此时对 doc 的其他借用已结束)
-    if let Some(id) = metadata_id_to_delete {
-        doc.objects.remove(&id);
-        println!("✅ 已物理删除 Metadata 对象流");
-    }
-
-    // --- 3. 保存文件 ---
-    if let Some(parent) = output_path.parent() {
-        if !parent.exists() { fs::create_dir_all(parent)?; }
-    }
-
     doc.save(&output_path)?;
-    println!("✅ 处理完成: {}", output_path.display());
+    Ok(output_path)
+}
 
-    Ok(())
+fn is_pdf(path: &Path) -> bool {
+    path.extension().and_then(|s| s.to_str()).map(|s| s.to_lowercase() == "pdf").unwrap_or(false)
+}
+
+fn wait_for_keypress() {
+    println!("\n按下回车键退出...");
+    let _ = io::stdin().read_line(&mut String::new());
 }
